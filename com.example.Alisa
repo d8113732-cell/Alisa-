@@ -1,0 +1,220 @@
+package com.example.voiceagent
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Bundle
+import android.speech.RecognizerIntent
+import android.speech.tts.TextToSpeech
+import android.telephony.SmsManager
+import android.widget.Button
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.Locale
+
+class MainActivity : AppCompatActivity() {
+
+    private val ANTHROPIC_API_KEY = "YOUR_API_KEY_HERE"
+
+    private lateinit var statusText: TextView
+    private lateinit var resultText: TextView
+    private lateinit var micButton: Button
+    private lateinit var tts: TextToSpeech
+
+    private val client = OkHttpClient()
+
+    private val speechLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            val data = result.data
+            val results = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+            val spokenText = results?.get(0) ?: ""
+            if (spokenText.isNotBlank()) {
+                statusText.text = "Siz aytdingiz: $spokenText"
+                sendToAI(spokenText)
+            }
+        }
+    }
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        statusText = findViewById(R.id.statusText)
+        resultText = findViewById(R.id.resultText)
+        micButton = findViewById(R.id.micButton)
+
+        tts = TextToSpeech(this) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts.language = Locale("uz")
+            }
+        }
+
+        requestNeededPermissions()
+
+        micButton.setOnClickListener {
+            startListening()
+        }
+    }
+
+    private fun requestNeededPermissions() {
+        val needed = mutableListOf<String>()
+        val perms = listOf(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.CALL_PHONE,
+            Manifest.permission.SEND_SMS
+        )
+        for (p in perms) {
+            if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(p)
+            }
+        }
+        if (needed.isNotEmpty()) {
+            permissionLauncher.launch(needed.toTypedArray())
+        }
+    }
+
+    private fun startListening() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestNeededPermissions()
+            return
+        }
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "uz-UZ")
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Buyruqni ayting...")
+        }
+        try {
+            speechLauncher.launch(intent)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Ovozni tanish mavjud emas", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun sendToAI(spokenText: String) {
+        statusText.text = "O'ylanyapman..."
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val systemPrompt = """
+                    Foydalanuvchi ovozli buyruq berdi. Faqat quyidagi JSON formatda javob qaytar,
+                    hech qanday qo'shimcha matn yozma:
+                    {
+                      "action": "call" | "sms" | "answer",
+                      "phone_number": "agar kerak bo'lsa, aks holda bo'sh",
+                      "message": "agar sms bo'lsa, xabar matni, aks holda bo'sh",
+                      "reply": "foydalanuvchiga ovozli aytiladigan qisqa javob"
+                    }
+                    Agar buyruq qo'ng'iroq yoki SMS haqida bo'lmasa, action ni "answer" qilib,
+                    reply maydonida savolga oddiy javob ber.
+                """.trimIndent()
+
+                val bodyJson = JSONObject().apply {
+                    put("model", "claude-sonnet-4-6")
+                    put("max_tokens", 300)
+                    put("system", systemPrompt)
+                    put("messages", JSONArray().put(
+                        JSONObject().apply {
+                            put("role", "user")
+                            put("content", spokenText)
+                        }
+                    ))
+                }
+
+                val request = Request.Builder()
+                    .url("https://api.anthropic.com/v1/messages")
+                    .addHeader("x-api-key", ANTHROPIC_API_KEY)
+                    .addHeader("anthropic-version", "2023-06-01")
+                    .addHeader("content-type", "application/json")
+                    .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
+                    .build()
+
+                client.newCall(request).execute().use { response ->
+                    val respBody = response.body?.string() ?: ""
+                    if (!response.isSuccessful) {
+                        withContext(Dispatchers.Main) {
+                            statusText.text = "Xatolik: ${response.code}"
+                            resultText.text = respBody
+                        }
+                        return@launch
+                    }
+                    val respJson = JSONObject(respBody)
+                    val contentArray = respJson.getJSONArray("content")
+                    val textBlock = contentArray.getJSONObject(0).getString("text")
+                    val actionJson = JSONObject(textBlock)
+
+                    withContext(Dispatchers.Main) {
+                        handleAction(actionJson)
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    statusText.text = "Xatolik yuz berdi"
+                    resultText.text = e.message ?: "Noma'lum xato"
+                }
+            }
+        }
+    }
+
+    private fun handleAction(actionJson: JSONObject) {
+        val action = actionJson.optString("action", "answer")
+        val reply = actionJson.optString("reply", "")
+
+        when (action) {
+            "call" -> {
+                val number = actionJson.optString("phone_number", "")
+                if (number.isNotBlank() && ActivityCompat.checkSelfPermission(
+                        this, Manifest.permission.CALL_PHONE
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    val callIntent = Intent(Intent.ACTION_CALL, Uri.parse("tel:$number"))
+                    startActivity(callIntent)
+                }
+            }
+            "sms" -> {
+                val number = actionJson.optString("phone_number", "")
+                val message = actionJson.optString("message", "")
+                if (number.isNotBlank() && ActivityCompat.checkSelfPermission(
+                        this, Manifest.permission.SEND_SMS
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    val smsManager = SmsManager.getDefault()
+                    smsManager.sendTextMessage(number, null, message, null, null)
+                }
+            }
+            else -> { }
+        }
+
+        statusText.text = "Bajarildi"
+        resultText.text = reply
+        if (reply.isNotBlank()) {
+            tts.speak(reply, TextToSpeech.QUEUE_FLUSH, null, null)
+        }
+    }
+
+    override fun onDestroy() {
+        tts.shutdown()
+        super.onDestroy()
+    }
+}
