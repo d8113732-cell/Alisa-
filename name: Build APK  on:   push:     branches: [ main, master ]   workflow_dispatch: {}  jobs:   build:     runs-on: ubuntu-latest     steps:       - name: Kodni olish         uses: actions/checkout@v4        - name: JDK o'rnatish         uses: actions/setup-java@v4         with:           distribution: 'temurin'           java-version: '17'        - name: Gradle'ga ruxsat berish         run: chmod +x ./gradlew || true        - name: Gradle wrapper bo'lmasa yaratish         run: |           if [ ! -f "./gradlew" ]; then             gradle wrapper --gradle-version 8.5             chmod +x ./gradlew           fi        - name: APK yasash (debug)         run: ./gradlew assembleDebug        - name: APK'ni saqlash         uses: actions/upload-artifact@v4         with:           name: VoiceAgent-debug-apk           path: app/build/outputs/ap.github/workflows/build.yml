@@ -1,0 +1,38 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodni olish
+        uses: actions/checkout@v4
+
+      - name: JDK o'rnatish
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Gradle'ga ruxsat berish
+        run: chmod +x ./gradlew || true
+
+      - name: Gradle wrapper bo'lmasa yaratish
+        run: |
+          if [ ! -f "./gradlew" ]; then
+            gradle wrapper --gradle-version 8.5
+            chmod +x ./gradlew
+          fi
+
+      - name: APK yasash (debug)
+        run: ./gradlew assembleDebug
+
+      - name: APK'ni saqlash
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceAgent-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
